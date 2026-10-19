@@ -1,0 +1,25 @@
+services:
+  random-podcast:
+    build: .
+    container_name: random-podcast
+    ports:
+      - "8720:5000"
+    volumes:
+      - ./data:/data       # сюда положить subscriptions.opml
+      - ./random-podcast.py:/app/random-podcast.py:ro
+    environment:
+      OPML_PATH: /data/subscriptions.xml
+      ADDED_FILE: /data/added.xml
+      CACHE_FILE: /data/episodes_cache.json
+      MANUAL_DIR: /data/manual
+      PLAYBACK_LOG: /data/playback_log.json
+      CACHE_TTL: "172800"   # 48 часов
+      MAX_PER_FEED: "1000"
+      DEBUG_SKIPS: "1"        # поставьте "0", когда разберётесь с пропусками
+      MAX_WORKERS: "1"          # последовательно — иначе 429
+      RATE_LIMIT_DELAY: "0.5"   # пауза между фидами
+      RETRY_MAX_ATTEMPTS: "3"
+      RECENT_DAYS: "30"
+      PLAYBACK_KEEP_DAYS: "30"
+      PLAYBACK_MIN_SEC: "600"
+    restart: unless-stopped
