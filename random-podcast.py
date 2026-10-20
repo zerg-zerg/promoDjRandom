@@ -8,7 +8,11 @@ random-podcast.py — случайный эпизод из подкастов в
     источниками обход синхронный, при протухшем TTL — фоновый;
   * фильтр по датам, чекбоксы подкастов, добавление по URL;
   * таблица подкастов, таблица эпизодов за месяц (с кнопкой play);
-  * лог прослушивания (>10 минут) на диск, показ за месяц;
+  * в списке последних эпизодов: метка «слушал» и чекбоксы очереди —
+    при проигрывании через play из списка по окончании включается
+    случайный отмеченный эпизод (состояние — в localStorage);
+  * лог прослушивания (>10 минут) на диск, показ за месяц; запись
+    по ходу прослушивания обновляется, т.е. часы пишутся целиком;
   * автопереход к следующему случайному эпизоду по окончании текущего
     (чекбокс, состояние хранится в localStorage);
   * прокси аудио (обход ERR_BLOCKED_BY_ORB, поддержка Range);
@@ -740,7 +744,16 @@ def podcast_stats(episodes, podcasts):
     return out
 
 
-def recent_episodes_view(episodes, days=RECENT_DAYS, limit=RECENT_LIMIT):
+def played_audios_view():
+    """Множество audio уже прослушанных (>= MIN_SEC) эпизодов."""
+    return {e.get("audio", "")
+            for e in _prune_playback(load_playback_log())
+            if int(e.get("listened_seconds", 0)) >= PLAYBACK_MIN_SEC}
+
+
+def recent_episodes_view(episodes, days=RECENT_DAYS, limit=RECENT_LIMIT,
+                         played=None):
+    played = played or set()
     cutoff = int(time.time()) - days * 86400
     out = []
     for e in episodes:
@@ -749,6 +762,7 @@ def recent_episodes_view(episodes, days=RECENT_DAYS, limit=RECENT_LIMIT):
         e2 = dict(e)
         e2["date_str"] = datetime.fromtimestamp(
             e["ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        e2["played"] = e["audio"] in played
         out.append(e2)
     out.sort(key=lambda x: x["ts"], reverse=True)
     return out[:limit]
@@ -787,12 +801,20 @@ def save_playback_log(entries):
 
 
 def append_playback(entry):
+    """Добавляет запись или обновляет существующую (тот же audio + start_ts):
+    растут end_ts и listened_seconds, пока эпизод играет."""
     with _playback_lock:
         entries = load_playback_log()
         key = (entry.get("audio", ""), int(entry.get("start_ts", 0)))
-        for e in entries:
+        new_end = int(entry.get("end_ts", 0))
+        new_secs = int(entry.get("listened_seconds", 0))
+        for i, e in enumerate(entries):
             if (e.get("audio", ""), int(e.get("start_ts", 0))) == key:
-                return False
+                e["end_ts"] = max(int(e.get("end_ts", 0)), new_end)
+                e["listened_seconds"] = max(
+                    int(e.get("listened_seconds", 0)), new_secs)
+                save_playback_log(entries)
+                return True
         entries.append(entry)
         save_playback_log(entries)
         return True
@@ -827,9 +849,11 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%8E%A7%3C/text%3E%3C/svg%3E">
 <title>Случайный подкаст</title>
 <style>
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 960px;
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 1160px;
          margin: 40px auto; padding: 0 20px; color: #111; }
   h1   { font-size: 1rem; color: #666; font-weight: 500; margin: 0 0 4px; }
   h2   { font-size: 1.35rem; margin: 0 0 4px; line-height: 1.3; }
@@ -881,27 +905,31 @@ PAGE = """<!doctype html>
   .badge-bg { display: inline-block; padding: 1px 8px; margin-left: 8px;
               background: #fff3c4; color: #7a5900; border-radius: 6px;
               font-size: .75rem; }
+  .badge-played { display: inline-block; padding: 1px 6px; margin-left: 4px;
+                  background: #dcefdc; color: #2c5f2d; border-radius: 6px;
+                  font-size: .72rem; font-weight: 600; vertical-align: middle; }
+  tr.played td { color: #999; }
+  tr.played td a.btn { background: #ddd; color: #555; }
 
   .tt { position: relative; display: inline-block; cursor: help;
         border-bottom: 1px dotted #bbb; }
-  .tt .tip {
-    display: none; position: absolute; z-index: 100;
-    top: 100%; left: 0; margin-top: 6px;
+  /* Скрытый источник содержимого тултипа внутри ячейки */
+  .tt .tip { display: none; }
+  /* Плавающий тултип: один на страницу, overlay поверх всего
+     (не обрезается overflow у .table-wrap) */
+  .tip-float {
+    position: fixed; display: none; z-index: 1000; pointer-events: none;
     background: #fff; border: 1px solid #ccc; border-radius: 8px;
-    box-shadow: 0 6px 20px rgba(0,0,0,.15);
+    box-shadow: 0 6px 20px rgba(0,0,0,.18);
     padding: 10px 12px; width: 360px; max-width: 90vw;
     font-size: .82rem; font-weight: 400; color: #333;
     line-height: 1.35; white-space: normal; text-align: left;
   }
-  .tt:hover .tip, .tt:focus-within .tip { display: block; }
-  .tt .tip img { max-width: 100%; max-height: 140px; border-radius: 6px;
-                 display: block; margin-bottom: 6px; }
-  .tt .tip .tip-title { font-weight: 600; margin-bottom: 4px; }
-  .tt .tip .tip-kv { color: #555; margin-top: 4px; }
-  .tt .tip .tip-kv b { color: #333; }
-  .tt .tip.tip-top { top: auto; bottom: 100%; margin-top: 0; margin-bottom: 6px; }
-  td:last-child .tt .tip, .tt.right .tip { left: auto; right: 0; }
-  .tt .tip.tip-left { left: 0; right: auto; }
+  .tip-float img { max-width: 100%; max-height: 140px; border-radius: 6px;
+                   display: block; margin-bottom: 6px; }
+  .tip-float .tip-title { font-weight: 600; margin-bottom: 4px; }
+  .tip-float .tip-kv { color: #555; margin-top: 4px; }
+  .tip-float .tip-kv b { color: #333; }
 </style>
 </head>
 <body>
@@ -955,6 +983,7 @@ PAGE = """<!doctype html>
          data-podcast="{{ ep.podcast }}"
          data-title="{{ ep.title }}"
          data-link="{{ ep.link }}"
+         data-from-play="{{ '1' if play_url else '0' }}"
          src="{{ url_for('proxy_audio', url=ep.audio) }}"></audio>
 
   <p class="autoplay-row">
@@ -983,6 +1012,7 @@ PAGE = """<!doctype html>
     <table>
       <thead>
         <tr>
+          <th class="cb" title="Отметьте — в очередь случайного автопроигрывания">Q</th>
           <th style="width: 130px;">Дата</th>
           <th style="width: 200px;">Подкаст</th>
           <th>Эпизод</th>
@@ -991,11 +1021,15 @@ PAGE = """<!doctype html>
       </thead>
       <tbody>
         {% for e in recent %}
-        <tr>
+        <tr{% if e.played %} class="played"{% endif %}>
+          <td class="cb">
+            <input type="checkbox" class="queue-cb" data-audio="{{ e.audio }}">
+          </td>
           <td>{{ e.date_str }}</td>
           <td>{{ e.podcast }}</td>
           <td>
             <span class="tt">{{ e.title }}
+              {% if e.played %}<span class="badge-played">✔ слушал</span>{% endif %}
               <div class="tip">
                 {% if e.image %}<img src="{{ e.image }}" alt="">{% endif %}
                 {% if e.summary %}<div>{{ e.summary }}</div>{% endif %}
@@ -1116,42 +1150,62 @@ function currentUrl() {
 function applyFilters(form) { window.location.href = currentUrl(); return false; }
 function nextRandom()       { window.location.href = currentUrl(); return false; }
 
-/* Тултипы */
+/* Тултипы: один плавающий элемент поверх страницы.
+   Содержимое берётся из скрытого .tip внутри наведённого .tt,
+   поэтому обрезание overflow у .table-wrap не страшно. */
 (function () {
   const GAP = 20;
-  function measureTip(tip) {
-    const prev = { visibility: tip.style.visibility, display: tip.style.display };
-    tip.style.visibility = 'hidden'; tip.style.display = 'block';
-    const h = tip.offsetHeight, w = tip.offsetWidth;
-    tip.style.visibility = prev.visibility; tip.style.display = prev.display;
-    return { h, w };
+  let floatEl = null, activeTip = null;
+
+  function ensureFloat() {
+    if (floatEl) return;
+    floatEl = document.createElement('div');
+    floatEl.className = 'tip tip-float';
+    document.body.appendChild(floatEl);
   }
-  function reposition(tt) {
+
+  function hide() {
+    if (floatEl) floatEl.style.display = 'none';
+    activeTip = null;
+  }
+
+  function show(tt) {
     const tip = tt.querySelector('.tip');
     if (!tip) return;
-    tip.classList.remove('tip-top');
-    const { h: tipH, w: tipW } = measureTip(tip);
+    ensureFloat();
+    if (activeTip !== tip) {
+      floatEl.innerHTML = tip.innerHTML;
+      activeTip = tip;
+    }
+    /* замер при скрытии — без мигания */
+    floatEl.style.visibility = 'hidden';
+    floatEl.style.display = 'block';
+    const w = floatEl.offsetWidth, h = floatEl.offsetHeight;
     const r = tt.getBoundingClientRect();
     const winH = window.innerHeight, winW = window.innerWidth;
-    const spaceBelow = winH - r.bottom - GAP;
-    const spaceAbove = r.top - GAP;
-    if (spaceBelow < tipH && spaceAbove > tipH) tip.classList.add('tip-top');
-    tip.classList.remove('tip-left', 'tip-right');
-    if (r.left + tipW > winW - GAP) tip.classList.add('tip-right');
-    else if (r.left < GAP && tipW < winW - 2 * GAP) tip.classList.add('tip-left');
+    let top = r.bottom + 8;
+    if (winH - r.bottom - GAP < h && r.top - GAP > h) top = r.top - h - 8;
+    let left = r.left;
+    if (left + w > winW - GAP) left = winW - GAP - w;
+    if (left < GAP) left = GAP;
+    floatEl.style.top = top + 'px';
+    floatEl.style.left = left + 'px';
+    floatEl.style.visibility = 'visible';
   }
+
   document.addEventListener('mouseover', e => {
     const tt = e.target.closest && e.target.closest('.tt');
-    if (tt) reposition(tt);
+    if (tt) show(tt);
   });
-  document.addEventListener('focusin', e => {
-    const tt = e.target.closest && e.target.closest('.tt');
-    if (tt) reposition(tt);
+  document.addEventListener('mouseout', e => {
+    if (!e.target.closest) return;
+    const tt = e.target.closest('.tt');
+    if (tt && !(e.relatedTarget && e.relatedTarget.closest &&
+                e.relatedTarget.closest('.tt'))) hide();
   });
-  window.addEventListener('resize', () => {
-    const h = document.querySelector('.tt:hover');
-    if (h) reposition(h);
-  });
+  /* прокрутка любого контейнера — прятать, т.к. fixed привязан к вьюпорту */
+  document.addEventListener('scroll', hide, true);
+  window.addEventListener('resize', hide);
 })();
 
 /* Лог прослушивания + автопереход к следующему эпизоду */
@@ -1161,15 +1215,16 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
 
   const MIN_SEC = {{ playback_min_sec }};
   const meta = {
-    audio:   audio.dataset.audio   || '',
-    podcast: audio.dataset.podcast || '',
-    title:   audio.dataset.title   || '',
-    link:    audio.dataset.link    || '',
+    audio:    audio.dataset.audio    || '',
+    podcast:  audio.dataset.podcast  || '',
+    title:    audio.dataset.title    || '',
+    link:     audio.dataset.link     || '',
+    fromPlay: audio.dataset.fromPlay === '1',
   };
 
   /* --- Лог прослушивания --- */
   let startTs = null, endTs = null;
-  let listened = 0, lastTick = null, logged = false;
+  let listened = 0, lastTick = null;
 
   if (meta.audio) {
     setInterval(function () {
@@ -1193,11 +1248,12 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
   }
 
   function sendLog() {
-    if (logged) return;
     if (!meta.audio) return;
     if (listened < MIN_SEC) return;
     if (startTs === null) return;
-    logged = true;
+    if (endTs === null || endTs < startTs) {
+      endTs = Math.floor(Date.now() / 1000);
+    }
     const body = JSON.stringify({
       audio:   meta.audio,
       podcast: meta.podcast,
@@ -1222,6 +1278,37 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
   window.addEventListener('beforeunload', sendLog);
   setInterval(sendLog, 30000);
 
+  /* --- Очередь из чекбоксов списка «последние» (localStorage) --- */
+  const QUEUE_KEY = 'recent-queue';
+  function loadQueue() {
+    try {
+      const v = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+      return Array.isArray(v) ? v.filter(x => typeof x === 'string') : [];
+    } catch (e) { return []; }
+  }
+  function saveQueue(arr) {
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(arr));
+  }
+  (function initQueue() {
+    const boxes = document.querySelectorAll('input.queue-cb');
+    if (!boxes.length) return;
+    const saved = new Set(loadQueue());
+    boxes.forEach(cb => {
+      cb.checked = saved.has(cb.dataset.audio);
+      cb.addEventListener('change', () => {
+        const s = new Set(loadQueue());
+        if (cb.checked) s.add(cb.dataset.audio); else s.delete(cb.dataset.audio);
+        saveQueue(Array.from(s));
+      });
+    });
+  })();
+
+  function playUrl(audioUrl) {
+    const params = new URLSearchParams((currentUrl().split('?')[1] || ''));
+    params.set('play', audioUrl);
+    return '/?' + params.toString();
+  }
+
   /* --- Автопереход к следующему эпизоду --- */
   const apCb = document.getElementById('autoplay-next');
   if (apCb) {
@@ -1236,10 +1323,22 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
   audio.addEventListener('ended', function () {
     sendLog();
     if (nextScheduled) return;
-    if (!(apCb && apCb.checked)) return;
     nextScheduled = true;
     /* небольшая задержка, чтобы sendBeacon успел уйти */
-    setTimeout(() => { window.location.href = currentUrl(); }, 1000);
+    setTimeout(function () {
+      /* Эпизод был запущен кнопкой play из списка «последние»:
+         следующий — случайный среди отмеченных чекбоксами. */
+      if (meta.fromPlay) {
+        const queue = loadQueue().filter(u => u && u !== meta.audio);
+        if (queue.length) {
+          const nxt = queue[Math.floor(Math.random() * queue.length)];
+          window.location.href = playUrl(nxt);
+          return;
+        }
+      }
+      if (!(apCb && apCb.checked)) return;
+      window.location.href = currentUrl();
+    }, 1000);
   });
 })();
 </script>
@@ -1298,7 +1397,8 @@ def index():
         total_all=len(episodes),
         total_filtered=len(filtered),
         podcasts=podcast_stats(episodes, podcasts_meta),
-        recent=recent_episodes_view(episodes),
+        recent=recent_episodes_view(
+            episodes, played=played_audios_view()),
         recent_days=RECENT_DAYS,
         playback_log=playback_view(),
         playback_keep_days=PLAYBACK_KEEP_DAYS,
