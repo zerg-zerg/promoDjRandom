@@ -9,8 +9,9 @@ random-podcast.py — случайный эпизод из подкастов в
   * фильтр по датам, чекбоксы подкастов, добавление по URL;
   * таблица подкастов, таблица эпизодов за месяц (с кнопкой play);
   * в списке последних эпизодов: метка «слушал» и чекбоксы очереди —
-    при проигрывании через play из списка по окончании включается
-    случайный отмеченный эпизод (состояние — в localStorage);
+    игрок клика play из списка меняет эпизод без перезагрузки страницы,
+    по окончании включается случайный отмеченный; выбор нигде не
+    хранится, сбрасывается любой перезагрузкой/refresh;
   * лог прослушивания (>10 минут) на диск, показ за месяц; запись
     по ходу прослушивания обновляется, т.е. часы пишутся целиком;
   * автопереход к следующему случайному эпизоду по окончании текущего
@@ -959,8 +960,8 @@ PAGE = """<!doctype html>
 
 {% if ep %}
   <h1>
-    <span class="tt">{{ ep.podcast }}
-      <div class="tip">
+    <span class="tt"><span id="ep-podcast">{{ ep.podcast }}</span>
+      <div class="tip" id="ep-tip">
         {% if ep.image %}<img src="{{ ep.image }}" alt="">{% endif %}
         <div class="tip-title">{{ ep.title }}</div>
         {% if ep.summary %}<div>{{ ep.summary }}</div>{% endif %}
@@ -972,11 +973,11 @@ PAGE = """<!doctype html>
       </div>
     </span>
   </h1>
-  <h2>{{ ep.title }}
-    {% if ep.manual_file %}<span class="badge-manual">manual</span>{% endif %}
-    {% if play_url %}<span class="badge-bg">выбран вручную</span>{% endif %}
+  <h2><span id="ep-title">{{ ep.title }}</span>
+    <span class="badge-manual" id="ep-manual-badge" style="{{ '' if ep.manual_file else 'display:none' }}">manual</span>
+    <span class="badge-bg" id="ep-manual-choice" style="{{ '' if play_url else 'display:none' }}">выбран вручную</span>
   </h2>
-  <p class="meta">{{ ep.published }}</p>
+  <p class="meta" id="ep-published">{{ ep.published }}</p>
 
   <audio controls autoplay preload="none" data-track="1"
          data-audio="{{ ep.audio }}"
@@ -1021,7 +1022,13 @@ PAGE = """<!doctype html>
       </thead>
       <tbody>
         {% for e in recent %}
-        <tr{% if e.played %} class="played"{% endif %}>
+        <tr{% if e.played %} class="played"{% endif %}
+           data-audio="{{ e.audio }}"
+           data-podcast="{{ e.podcast }}"
+           data-title="{{ e.title }}"
+           data-link="{{ e.link }}"
+           data-published="{{ e.published }}"
+           data-manual="{{ e.manual_file }}">
           <td class="cb">
             <input type="checkbox" class="queue-cb" data-audio="{{ e.audio }}">
           </td>
@@ -1039,7 +1046,7 @@ PAGE = """<!doctype html>
             </span>
           </td>
           <td>
-            <a class="btn small" href="?play={{ e.audio|urlencode }}{{ preserve_qs|safe }}">▶</a>
+            <a class="btn small play-ep" href="?play={{ e.audio|urlencode }}{{ preserve_qs|safe }}">▶</a>
           </td>
         </tr>
         {% endfor %}
@@ -1214,7 +1221,7 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
   if (!audio) return;
 
   const MIN_SEC = {{ playback_min_sec }};
-  const meta = {
+  let meta = {
     audio:    audio.dataset.audio    || '',
     podcast:  audio.dataset.podcast  || '',
     title:    audio.dataset.title    || '',
@@ -1278,36 +1285,72 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
   window.addEventListener('beforeunload', sendLog);
   setInterval(sendLog, 30000);
 
-  /* --- Очередь из чекбоксов списка «последние» (localStorage) --- */
-  const QUEUE_KEY = 'recent-queue';
-  function loadQueue() {
-    try {
-      const v = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
-      return Array.isArray(v) ? v.filter(x => typeof x === 'string') : [];
-    } catch (e) { return []; }
+  /* --- Очередь = живые чекбоксы в DOM. Нигде не хранится:
+         любая перезагрузка страницы сбрасывает выбор. --- */
+  function queueBoxes(excludeAudio) {
+    if (!document.querySelector('input.queue-cb')) return [];
+    return Array.from(document.querySelectorAll('tr[data-audio]'))
+      .filter(tr => tr.dataset.audio !== excludeAudio &&
+                    tr.querySelector('input.queue-cb:checked'));
   }
-  function saveQueue(arr) {
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(arr));
-  }
-  (function initQueue() {
-    const boxes = document.querySelectorAll('input.queue-cb');
-    if (!boxes.length) return;
-    const saved = new Set(loadQueue());
-    boxes.forEach(cb => {
-      cb.checked = saved.has(cb.dataset.audio);
-      cb.addEventListener('change', () => {
-        const s = new Set(loadQueue());
-        if (cb.checked) s.add(cb.dataset.audio); else s.delete(cb.dataset.audio);
-        saveQueue(Array.from(s));
-      });
-    });
-  })();
 
-  function playUrl(audioUrl) {
-    const params = new URLSearchParams((currentUrl().split('?')[1] || ''));
-    params.set('play', audioUrl);
-    return '/?' + params.toString();
+  const logState = {
+    reset: function () {
+      startTs = null; endTs = null; lastTick = null; listened = 0;
+    },
+  };
+
+  function swapEpisode(tr) {
+    sendLog(); /* дособрать предыдущий эпизод, если дослушан до порога */
+    const data = tr.dataset;
+    audio.dataset.audio    = data.audio || '';
+    audio.dataset.podcast  = data.podcast || '';
+    audio.dataset.title    = data.title || '';
+    audio.dataset.link     = data.link || '';
+    audio.dataset.fromPlay = '1';
+    meta = {
+      audio:   audio.dataset.audio,
+      podcast: audio.dataset.podcast,
+      title:   audio.dataset.title,
+      link:    audio.dataset.link,
+      fromPlay: true,
+    };
+
+    const epTitle = document.getElementById('ep-title');
+    if (epTitle) epTitle.textContent = meta.title;
+    const epPodcast = document.getElementById('ep-podcast');
+    if (epPodcast) epPodcast.textContent = meta.podcast;
+    const epPublished = document.getElementById('ep-published');
+    if (epPublished) epPublished.textContent = data.published || '';
+    const rowTip = tr.querySelector('.tip');
+    const epTip = document.getElementById('ep-tip');
+    if (rowTip && epTip) epTip.innerHTML = rowTip.innerHTML;
+    const manualBadge = document.getElementById('ep-manual-badge');
+    if (manualBadge) manualBadge.style.display = data.manual ? '' : 'none';
+    const choiceBadge = document.getElementById('ep-manual-choice');
+    if (choiceBadge) choiceBadge.style.display = '';
+
+    nextScheduled = false;
+    logState.reset();
+    audio.src = '/audio?url=' + encodeURIComponent(meta.audio);
+    audio.play().catch(e => console.warn('play() отклонён браузером:', e));
   }
+
+  /* Кнопка ▶ из списка: переключение эпизода на месте (без рефреша) —
+     ТОЛЬКО если в списке есть отмеченные галочки (есть очередь для
+     продолжения). Во всех остальных случаях — обычная навигация по
+     href (?play=...), т.е. рефреш страницы. */
+  document.querySelectorAll('a.play-ep').forEach(a => {
+    a.addEventListener('click', function (e) {
+      const tr = a.closest && a.closest('tr[data-audio]');
+      if (!tr) return;
+      const hasQueue = queueBoxes(tr.dataset.audio).length > 0;
+      if (!hasQueue || tr.dataset.audio === meta.audio) return;
+      /* обычный href остаётся fallback-ом на случай JS-ошибки */
+      e.preventDefault();
+      swapEpisode(tr);
+    });
+  });
 
   /* --- Автопереход к следующему эпизоду --- */
   const apCb = document.getElementById('autoplay-next');
@@ -1326,13 +1369,15 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
     nextScheduled = true;
     /* небольшая задержка, чтобы sendBeacon успел уйти */
     setTimeout(function () {
-      /* Эпизод был запущен кнопкой play из списка «последние»:
-         следующий — случайный среди отмеченных чекбоксами. */
+      /* Продолжение очереди (галочки в списке «последние» + запуск
+         кнопкой play оттуда) — случайный отмеченный, переключение
+         на месте. Все остальные случаи — рефреш страницы. */
       if (meta.fromPlay) {
-        const queue = loadQueue().filter(u => u && u !== meta.audio);
-        if (queue.length) {
-          const nxt = queue[Math.floor(Math.random() * queue.length)];
-          window.location.href = playUrl(nxt);
+        const boxes = queueBoxes(meta.audio);
+        if (boxes.length) {
+          nextScheduled = false;
+          const tr = boxes[Math.floor(Math.random() * boxes.length)];
+          swapEpisode(tr);
           return;
         }
       }
