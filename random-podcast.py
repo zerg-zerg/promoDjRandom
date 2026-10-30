@@ -1032,7 +1032,7 @@ PAGE = """<!doctype html>
           <td class="cb">
             <input type="checkbox" class="queue-cb" data-audio="{{ e.audio }}">
           </td>
-          <td>{{ e.date_str }}</td>
+          <td class="ts" data-ts="{{ e.ts }}">{{ e.date_str }}</td>
           <td>{{ e.podcast }}</td>
           <td>
             <span class="tt">{{ e.title }}
@@ -1093,8 +1093,8 @@ PAGE = """<!doctype html>
           </td>
           <td>{% if p.link %}<a href="{{ p.link }}" target="_blank" rel="noopener">{{ p.link }}</a>{% else %}—{% endif %}</td>
           <td class="num">{{ p.count }}</td>
-          <td>{{ p.first_date }}</td>
-          <td>{{ p.last_date }}</td>
+          <td class="ts" data-ts="{{ p.first_ts }}" data-fmt="date">{{ p.first_date }}</td>
+          <td class="ts" data-ts="{{ p.last_ts }}" data-fmt="date">{{ p.last_date }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1122,8 +1122,8 @@ PAGE = """<!doctype html>
         <tr>
           <td>{{ r.podcast }}</td>
           <td>{{ r.title }}</td>
-          <td>{{ r.start_str }}</td>
-          <td>{{ r.end_str }}</td>
+          <td class="ts" data-ts="{{ r.start_ts }}">{{ r.start_str }}</td>
+          <td class="ts" data-ts="{{ r.end_ts }}">{{ r.end_str }}</td>
           <td>{{ r.listened_str }}</td>
           <td>{% if r.link %}<a href="{{ r.link }}" target="_blank" rel="noopener">→</a>{% endif %}</td>
         </tr>
@@ -1156,6 +1156,23 @@ function currentUrl() {
 }
 function applyFilters(form) { window.location.href = currentUrl(); return false; }
 function nextRandom()       { window.location.href = currentUrl(); return false; }
+
+/* Время показываем в часовом поясе браузера: сервер отдаёт epoch в
+   data-ts (а в тексте — UTC как fallback без JS), здесь перерисовываем
+   в локальном поясе. data-fmt="date" — только дата без времени. */
+(function () {
+  const pad = n => String(n).padStart(2, '0');
+  document.querySelectorAll('[data-ts]').forEach(el => {
+    const ts = Number(el.dataset.ts);
+    if (!ts) return;
+    const d = new Date(ts * 1000);
+    const date = d.getFullYear() + '-' + pad(d.getMonth() + 1) +
+                 '-' + pad(d.getDate());
+    el.textContent = el.dataset.fmt === 'date'
+      ? date
+      : date + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  });
+})();
 
 /* Тултипы: один плавающий элемент поверх страницы.
    Содержимое берётся из скрытого .tip внутри наведённого .tt,
@@ -1336,18 +1353,16 @@ function nextRandom()       { window.location.href = currentUrl(); return false;
     audio.play().catch(e => console.warn('play() отклонён браузером:', e));
   }
 
-  /* Кнопка ▶ из списка: переключение эпизода на месте (без рефреша) —
-     ТОЛЬКО если в списке есть отмеченные галочки (есть очередь для
-     продолжения). Во всех остальных случаях — обычная навигация по
-     href (?play=...), т.е. рефреш страницы. */
+  /* Кнопка ▶ из списка: всегда переключение эпизода на месте — без
+     рефреша и без ?play в адресной строке. Клик по текущему эпизоду —
+     no-op (не перезапускает его с начала). href (?play=...) остаётся
+     fallback-ом на случай отключённого/упавшего JS. */
   document.querySelectorAll('a.play-ep').forEach(a => {
     a.addEventListener('click', function (e) {
       const tr = a.closest && a.closest('tr[data-audio]');
       if (!tr) return;
-      const hasQueue = queueBoxes(tr.dataset.audio).length > 0;
-      if (!hasQueue || tr.dataset.audio === meta.audio) return;
-      /* обычный href остаётся fallback-ом на случай JS-ошибки */
       e.preventDefault();
+      if (tr.dataset.audio === meta.audio) return;
       swapEpisode(tr);
     });
   });
